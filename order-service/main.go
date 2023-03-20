@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,16 +11,37 @@ import (
 	"github.com/gorilla/mux"
 )
 
+const (
+	productServiceHost = "http://localhost:8000/"
+)
+
+type Product struct {
+	ID             int       `json:"id"`
+	Name           string    `json:"name"`
+	Price          float64   `json:"price"`
+	InventoryCount int       `json:"inventory_count"`
+	Category       string    `json:"category"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type ProductCatalog struct {
+	Products []Product `json:"products"`
+}
+
+type OrderItem struct {
+	ProductID    int     `json:"product_id"`
+	ProductPrice float64 `json:"product_price"`
+	ProductQty   int     `json:"product_qty"`
+}
+
 type Order struct {
-	ID            int       `json:"id"`
-	ProductID     int       `json:"product_id"`
-	ProductPrice  float64   `json:"product_price"`
-	ProductQty    int       `json:"product_qty"`
-	Discount      float64   `json:"discount"`
-	OrderValue    float64   `json:"order_value"`
-	OrderStatus   string    `json:"order_status"`
-	DispatchDate  time.Time `json:"dispatch_date"`
-	OrderDateTime time.Time `json:"order_date_time"`
+	ID               int         `json:"id"`
+	Items            []OrderItem `json:"items"`
+	Value            float64     `json:"value"`
+	Status           string      `json:"status"`
+	Discount         float64     `json:"discount"`
+	DispatchDate     time.Time   `json:"dispatch_date"`
+	CreationDateTime time.Time   `json:"creation_date_time"`
 }
 
 var (
@@ -53,6 +75,7 @@ func getOrdersHandler(w http.ResponseWriter, r *http.Request) {
 func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
+	// Decoding the request
 	var order Order
 	err := json.NewDecoder(r.Body).Decode(&order)
 	if err != nil {
@@ -61,26 +84,63 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order.OrderDateTime = time.Now()
-	order.Discount = 0
-	order.OrderValue = order.ProductPrice * float64(order.ProductQty)
-
-	if order.OrderStatus == "" {
-		order.OrderStatus = "Placed"
-	} else if order.OrderStatus != "Placed" {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "Invalid order status: %s", order.OrderStatus)
+	// Get product catalogue from the product service
+	productCatalog, err := getProductCatalog()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Failed to get product catalog: %v", err)
 		return
 	}
 
-	if order.ProductQty > 10 {
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "Quantity exceeds maximum allowed: %d", order.ProductQty)
-		return
+	productsMap := make(map[int]*Product)
+	for i := range productCatalog.Products {
+		productsMap[productCatalog.Products[i].ID] = &productCatalog.Products[i]
 	}
 
-	orders[orderID] = &order
+	premiumProductCount := 0
+	orderValue := float64(0)
+	for _, orderItem := range order.Items {
+		product := productsMap[orderItem.ProductID]
+
+		// Check if enough products are available in the inventory
+		if product.InventoryCount < orderItem.ProductQty {
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintf(w, "There is not enough of %q to fulfill this order", product.Name)
+			return
+		}
+
+		// Calculate order value
+		orderValue += product.Price * float64(orderItem.ProductQty)
+		orderItem.ProductPrice = product.Price
+
+		// Count the premium products in the order
+		if product.Category == "Premium" {
+			premiumProductCount++
+		}
+	}
+
+	// Calculate the discault and order value
+	order.Value = orderValue
+	if premiumProductCount >= 3 {
+		order.Discount = 10
+		order.Value -= order.Value * order.Discount / 100
+	}
+
+	// Create the order
 	order.ID = orderID
+	order.CreationDateTime = time.Now()
+	order.Status = "Placed"
+
+	// Update the catalogue
+	err = updateProductCatalog(productsMap, &order)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "Failed to update product catalog: %v", err)
+		return
+	}
+
+	// Save the order
+	orders[order.ID] = &order
 	orderID++
 	json.NewEncoder(w).Encode(order)
 }
@@ -88,7 +148,8 @@ func createOrderHandler(w http.ResponseWriter, r *http.Request) {
 func updateOrderHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	idStr := r.URL.Path[len("/orders/"):]
+	vars := mux.Vars(r)
+	idStr := vars["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -111,23 +172,79 @@ func updateOrderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if update.OrderStatus != "" {
-		if update.OrderStatus != "Dispatched" && update.OrderStatus != "Completed" && update.OrderStatus != "Cancelled" {
+	if update.Status != "" {
+		if update.Status != "Dispatched" && update.Status != "Completed" && update.Status != "Cancelled" {
 			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprintf(w, "Invalid order status: %s", update.OrderStatus)
+			fmt.Fprintf(w, "Invalid order status: %s", update.Status)
 			return
 		}
-		order.OrderStatus = update.OrderStatus
+		order.Status = update.Status
 	}
 
-	if order.OrderStatus == "Dispatched" {
+	if order.Status == "Dispatched" {
 		if update.DispatchDate.IsZero() {
 			update.DispatchDate = time.Now()
 		}
 		order.DispatchDate = update.DispatchDate
 	}
 
+	// TODO: If order status is cancelled, return the product back to the inventory
+
 	orders[id] = order
 
 	json.NewEncoder(w).Encode(order)
+}
+
+func getProductCatalog() (*ProductCatalog, error) {
+	resp, err := http.Get(productServiceHost + "/products")
+	if err != nil {
+		return nil, err
+	}
+
+	productCatalog := &ProductCatalog{}
+	err = json.NewDecoder(resp.Body).Decode(productCatalog)
+	if err != nil {
+		return nil, err
+	}
+
+	return productCatalog, nil
+}
+
+func updateProductCatalog(products map[int]*Product, order *Order) error {
+	client := &http.Client{}
+	url := productServiceHost + "/products"
+
+	productList := make([]Product, 0, len(order.Items))
+	for _, orderItem := range order.Items {
+		product := *products[orderItem.ProductID]
+
+		product.InventoryCount -= orderItem.ProductQty
+		if product.InventoryCount < 0 {
+			return fmt.Errorf("invalid inventory count")
+		}
+
+		productList = append(productList, product)
+	}
+
+	payload, err := json.Marshal(productList)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, url, bytes.NewBuffer(payload))
+	if err != nil {
+		return fmt.Errorf("failed to create update product request: %v", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to do update product request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("update product request failed with status: %s", resp.Status)
+	}
+
+	return nil
 }
